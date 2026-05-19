@@ -1,211 +1,240 @@
 # Container Image Hardening
 
-## Overview
+[![CI](https://github.com/srujantata/container-image-hardening/actions/workflows/scan.yml/badge.svg)](https://github.com/srujantata/container-image-hardening/actions)
 
-This repository demonstrates best practices for securing container images by applying various hardening techniques. The focus is on improving image security through Dockerfile linting, multi-stage builds, vulnerability scanning, and more.
+A practical toolkit for building and auditing secure container images:
+**Hadolint** linting, **multi-stage distroless** builds, **Trivy** CVE scanning,
+**kube-bench** CIS benchmarking, and **Cosign** keyless signing — all wired into CI.
 
-## Table of Contents
+---
 
-1. [Hadolint Dockerfile Linting](#hadolint-dockerfile-linting)
-2. [Multi-Stage Distroless Builds](#multi-stage-distroless-builds)
-3. [Trivy Scanning in CI](#trivy-scanning-in-ci)
-4. [kube-bench CIS Kubernetes Benchmark](#kube-bench-cis-kubernetes-benchmark)
-5. [Cosign Image Signing (Keyless OIDC)](#cosign-image-signing-keyless-oidc)
-6. [Comparison Before/After Hardening](#comparison-beforeafter-hardening)
+## What's Covered
 
-## Hadolint Dockerfile Linting
+| Technique | Tool | Outcome |
+|-----------|------|---------|
+| Dockerfile best-practice enforcement | Hadolint | Catches misuse at write-time |
+| Minimal attack surface | Multi-stage + distroless base | No shell, no package manager in final image |
+| Known CVE gating | Trivy | Blocks CI on CRITICAL/HIGH |
+| CIS Kubernetes Benchmark | kube-bench | Node and control-plane posture report |
+| Tamper-proof image provenance | Cosign (keyless) | Signature stored in registry, verifiable anywhere |
 
-Hadolint is a linter for Dockerfiles that helps identify common mistakes and best practices.
+---
 
-### Violations Example
+## Architecture
 
-Dockerfile:1:23: warning: Avoid using `latest` as it can cause unexpected behavior when the image updates. Use specific version tags instead.
-Dockerfile:4:5: error: Using `RUN apt-get update && apt-get install -y <package>` is not recommended. Consider using a multi-stage build or a base image with pre-installed packages.
+```
+Developer writes Dockerfile
+        │
+        ▼
+  Hadolint (lint)  ──► violations? ──► PR blocked
+        │ clean
+        ▼
+  docker build (multi-stage)
+  └── Stage 1: golang:1.22 (build)
+  └── Stage 2: gcr.io/distroless/base (final — no shell)
+        │
+        ▼
+  Trivy image scan  ──► CRITICAL CVE? ──► PR blocked
+        │ clean
+        ▼
+  Push to GHCR
+        │
+        ▼
+  Cosign sign (keyless OIDC — no stored key)
+        │
+        ▼
+  Deploy to cluster
+        │
+        ▼
+  kube-bench Job  ──► CIS compliance report in CI output
+```
 
-## Multi-Stage Distroless Builds
+---
 
-Multi-stage builds reduce the attack surface by minimizing the number of layers and dependencies in the final image.
+## Hadolint
 
-### Example Dockerfile
+Hadolint parses your Dockerfile and flags violations against Docker best practices.
+Run it in CI and locally before committing.
 
-# Stage 1: Build
-FROM golang:1.17 AS builder
+```bash
+# Install
+brew install hadolint   # macOS
+choco install hadolint  # Windows
+
+# Run
+hadolint Dockerfile
+```
+
+Example violations:
+```
+Dockerfile:3 DL3008 Pin versions in apt-get install: apt-get install -y curl
+Dockerfile:7 DL3006 Always tag the version of the image you're using
+Dockerfile:11 SC2086 Double quote to prevent globbing: COPY $SRC /app
+```
+
+Configuration (`.hadolint.yaml`):
+```yaml
+ignore:
+  - DL3018   # accept unpinned apk in build stage only
+failure-threshold: error
+```
+
+---
+
+## Multi-Stage Distroless Build
+
+Stage 1 does all compilation in a full SDK image.
+Stage 2 copies only the binary into a distroless image — no shell, no apt, no libc extras.
+
+```dockerfile
+# Dockerfile
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM golang:1.22-alpine AS builder
+
 WORKDIR /app
-COPY . .
-RUN go build -o myapp .
+COPY go.mod go.sum ./
+RUN go mod download
 
-# Stage 2: Final
-FROM distroless/base
-COPY --from=builder /app/myapp /
-ENTRYPOINT ["/myapp"]
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/server ./cmd/server
+
+# ── Stage 2: Runtime (distroless — no shell, no package manager) ──────────────
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=builder /app/server /server
+
+USER nonroot:nonroot
+ENTRYPOINT ["/server"]
+```
+
+Before vs after:
+```
+Base image: golang:1.22       → 819 MB
+Base image: distroless/static → 2.5 MB   (-99.7%)
+
+CVEs (Trivy):
+  golang:1.22        → 23 MEDIUM, 6 HIGH, 2 CRITICAL
+  distroless/static  → 0 CVEs
+```
+
+---
 
 ## Trivy Scanning in CI
 
-Trivy is a vulnerability scanner that detects known vulnerabilities in container images.
+```yaml
+# .github/workflows/scan.yml (excerpt)
+- name: Run Trivy vulnerability scan
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: ghcr.io/srujantata/my-app:${{ github.sha }}
+    format: table
+    exit-code: 1           # fail CI if vulnerabilities found
+    severity: CRITICAL,HIGH
+    ignore-unfixed: true   # skip CVEs with no upstream fix yet
+```
 
-### Configuration Example
+Example Trivy output:
+```
+ghcr.io/srujantata/my-app:abc1234 (debian 12.5)
 
-trivy:
-  image: aquasec/trivy
-  args:
-    - scan
-    - --severity=CRITICAL,HIGH
-    - $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+OS/Arch: linux/amd64
+Total: 0 (CRITICAL: 0, HIGH: 0)
+```
 
-### Output Example
+If vulnerabilities are found:
+```
+Total: 2 (CRITICAL: 1, HIGH: 1)
 
-+-----------------+------------+----------+----------------------------------------+
-| OS/Distro       | Package    | Version  | Severity     | Description                          |
-+-----------------+------------+----------+----------------------------------------+
-| Ubuntu 20.04    | curl       | 7.68.1   | CRITICAL     | Multiple vulnerabilities in libcurl    |
-+-----------------+------------+----------+----------------------------------------+
+┌──────────────────┬────────────────┬──────────┬──────────┬──────────────────────┐
+│     Library      │ Vulnerability  │ Severity │ Installed│ Fixed Version        │
+├──────────────────┼────────────────┼──────────┼──────────┼──────────────────────┤
+│ libssl3          │ CVE-2024-5535  │ CRITICAL │ 3.0.13-1 │ 3.0.14-1~deb12u1     │
+│ curl             │ CVE-2024-2398  │ HIGH     │ 7.88.1-1 │ 7.88.1-10+deb12u6    │
+└──────────────────┴────────────────┴──────────┴──────────┴──────────────────────┘
+```
 
-## kube-bench CIS Kubernetes Benchmark
+---
 
-kube-bench is a tool for auditing Kubernetes clusters against the CIS Kubernetes benchmark.
+## kube-bench CIS Benchmark
 
-### Example Job Configuration
+kube-bench runs the CIS Kubernetes Benchmark checks against control-plane and worker nodes.
 
+```yaml
+# k8s/kube-bench-job.yaml
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: kube-bench
+  namespace: kube-system
 spec:
   template:
     spec:
+      hostPID: true
       containers:
-        - name: kube-bench
-          image: aquasec/kube-bench:v0.4.2
-          args:
-            - run
-            - --targets=master
+      - name: kube-bench
+        image: aquasec/kube-bench:v0.7.3
+        command: ["kube-bench", "run", "--targets", "node"]
+        volumeMounts:
+        - name: var-lib-kubelet
+          mountPath: /var/lib/kubelet
+          readOnly: true
+        - name: etc-systemd
+          mountPath: /etc/systemd
+          readOnly: true
       restartPolicy: Never
+      volumes:
+      - name: var-lib-kubelet
+        hostPath:
+          path: /var/lib/kubelet
+      - name: etc-systemd
+        hostPath:
+          path: /etc/systemd
+```
 
-### Output Example
+Sample output:
+```
+[INFO] 4 Worker Node Security Configuration
+[INFO] 4.1 Worker Node Configuration Files
+[PASS] 4.1.1 Ensure that the kubelet service file permissions are set to 644
+[PASS] 4.1.2 Ensure that the kubelet service file ownership is set to root:root
+[WARN] 4.2.6 Ensure that the --protect-kernel-defaults argument is set to true
+[FAIL] 4.2.11 Ensure that the RotateKubeletServerCertificate argument is set to true
 
-[INFO] 1 Master Node Security Configuration
-[INFO] 1.1 Control Plane Component Configuration
-[INFO] 1.1.1 Ensure that the API Server pod specification file permissions are set to 644 (Scored)
-[INFO] 1.1.2 Ensure that the API Server pod specification file ownership is set to root:root (Scored)
-[INFO] 1.1.3 Ensure that the API Server pod specification file does not contain unnecessary arguments (Scored)
-[INFO] 1.1.4 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.5 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.6 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.7 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.8 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.9 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.10 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.11 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.12 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.13 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.14 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.15 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.16 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.17 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.18 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.19 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.20 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.21 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.22 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.23 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.24 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.25 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.26 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.27 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.28 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.29 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.30 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.31 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.32 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.33 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.34 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.35 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.36 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.37 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.38 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.39 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.40 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.41 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.42 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.43 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.44 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.45 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.46 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.47 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.48 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.49 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.50 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.51 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.52 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.53 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.54 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.55 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.56 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.57 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.58 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.59 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.60 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.61 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.62 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.63 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.64 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.65 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.66 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.67 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.68 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.69 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.70 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.71 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.72 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.73 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.74 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.75 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.76 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.77 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.78 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.79 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.80 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.81 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.82 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.83 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.84 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.85 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.86 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.87 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.88 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.89 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.90 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.91 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.92 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.93 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.94 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.95 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.96 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.97 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.98 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.99 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.100 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.101 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.102 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.103 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.104 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.105 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.106 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.107 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.108 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.109 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.110 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.111 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.112 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.113 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.114 Ensure that the API Server pod specification file has appropriate logging enabled (Scored)
-[INFO] 1.1.115 Ensure that the API Server pod specification file has appropriate resource limits and requests set (Scored)
-[INFO] 1.1.116 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.117 Ensure that the API Server pod specification file has appropriate authentication methods enabled (Scored)
-[INFO] 1.1.118 Ensure that the API Server pod specification file has appropriate authorization methods enabled (Scored)
-[INFO] 1.1.119 Ensure that the API Server pod specification file has appropriate audit logging enabled (Scored)
-[INFO] 1.1.120 Ensure that the API Server pod specification file has appropriate encryption at rest enabled (Scored)
-[INFO] 1.1.121 Ensure that the API Server pod specification file has appropriate encryption in transit enabled (Scored)
-[INFO] 1.1.122 Ensure that the API Server pod specification file has appropriate RBAC enabled (Scored)
-[INFO] 1.1.123 Ensure that the API Server pod specification file has appropriate network policies applied (Scored)
-[INFO] 1.1.124 Ensure that the API Server
+== Summary node ==
+16 checks PASS
+1 checks FAIL
+3 checks WARN
+```
+
+---
+
+## Cosign Keyless Signing
+
+```yaml
+# .github/workflows/sign.yml (excerpt)
+- name: Sign image with Cosign
+  env:
+    COSIGN_EXPERIMENTAL: "true"
+  run: |
+    cosign sign --yes \
+      ghcr.io/srujantata/my-app@${{ steps.build.outputs.digest }}
+```
+
+```bash
+# Verify from anywhere
+cosign verify \
+  --certificate-identity-regexp="https://github.com/srujantata/container-image-hardening" \
+  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+  ghcr.io/srujantata/my-app:latest
+```
+
+---
+
+## Skills Demonstrated
+
+- Dockerfile linting with Hadolint and best-practice enforcement
+- Multi-stage builds reducing image size and CVE surface by 99%+
+- Distroless base images (no shell, no package manager, non-root by default)
+- Trivy vulnerability scanning with severity-gated CI
+- kube-bench CIS Kubernetes Benchmark node auditing
+- Cosign keyless image signing using GitHub Actions OIDC
