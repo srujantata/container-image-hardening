@@ -1,0 +1,118 @@
+name: Container Image Security
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+jobs:
+  lint-dockerfile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Install Hadolint
+        run: |
+          wget -qO- https://github.com/hadolint/hadolint/releases/download/v2.10.0/hadolint-Linux-x86_64 | sudo tee /usr/local/bin/hadolint > /dev/null 2>&1
+          chmod +x /usr/local/bin/hadolint
+      - name: Lint Dockerfile
+        run: hadolint Dockerfile
+
+  build-and-scan:
+    needs: lint-dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up QEMU for multi-arch builds
+        uses: docker/setup-qemu-action@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build Docker image
+        run: |
+          DOCKER_BUILDKIT=1 docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/${{ github.repository }}:latest --push .
+      - name: Set IMAGE variable for Trivy scan
+        id: set_image
+        run: echo "::set-output name=image::ghcr.io/${{ github.repository }}:latest"
+
+  filesystem-scan:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Run Trivy filesystem scan
+        run: trivy fs . --exit-code 0 --severity HIGH,CRITICAL
+
+  image-scan:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up QEMU for multi-arch builds
+        uses: docker/setup-qemu-action@v2
+      - name: Run Trivy image scan
+        run: trivy image ${{ needs.build-and-scan.outputs.image }} --exit-code 1 --severity CRITICAL
+
+  upload-sarif:
+    needs: filesystem-scan, image-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up QEMU for multi-arch builds
+        uses: docker/setup-qemu-action@v2
+      - name: Upload Trivy results as SARIF
+        uses: github/codeql-action/upload-sarif@v1
+        with:
+          sarif_file: trivy-report.sarif
+
+  sign-image:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up QEMU for multi-arch builds
+        uses: docker/setup-qemu-action@v2
+      - name: Sign Docker image with Cosign keyless
+        run: cosign sign --keyless ghcr.io/${{ github.repository }}:latest
+
+  post-scan-summary:
+    needs: filesystem-scan, image-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Get Trivy scan results
+        run: |
+          trivy fs . --format json > trivy-report.json
+          trivy image ${{ needs.build-and-scan.outputs.image }} --format json >> trivy-report.json
+      - name: Parse CVE counts
+        id: parse_cve_counts
+        run: |
+          cves=$(jq '.Results[].Vulnerabilities | length' trivy-report.json)
+          echo "::set-output name=cve_count::$cves"
+      - name: Post scan summary as PR comment
+        if: github.event_name == 'pull_request'
+        run: |
+          cves=${{ steps.parse_cve_counts.outputs.cve_count }}
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "Total CVEs found: $cves" >> $GITHUB_STEP_SUMMARY

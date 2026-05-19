@@ -1,0 +1,42 @@
+Dockerfile
+# Stage 1: Builder
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN apk add --no-cache build-base && \
+    npm install --only=production
+
+COPY dist ./dist
+COPY node_modules ./node_modules
+
+# Stage 2: Final
+FROM node:20-alpine
+
+LABEL org.opencontainers.image.title="My Application" \
+      org.opencontainers.image.description="A production-ready Node.js application" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.authors="Your Name <your.email@example.com>" \
+      org.opencontainers.image.url="https://example.com" \
+      org.opencontainers.image.source="https://github.com/yourusername/myapp"
+
+WORKDIR /app
+
+RUN addgroup -S appuser && \
+    adduser -S -G appuser appuser && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
+COPY --from=builder dist ./dist
+COPY --from=builder node_modules ./node_modules
+
+HEALTHCHECK CMD [ "curl", "-f", "http://localhost:3000/health" ] || exit 1
+
+# Read-only hints (mount /tmp as tmpfs at runtime)
+# No SUID binaries hint
+
+EXPOSE 3000
+
+CMD ["node", "dist/index.js"]

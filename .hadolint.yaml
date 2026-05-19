@@ -1,0 +1,11 @@
+version: "1"
+failureThreshold: warning
+ignoredChecks:
+  - DL3008
+  - DL3009
+securityChecks: all
+trustedRegistries:
+  - gcr.io
+  - docker.io
+  - ghcr.io
+format: tty
